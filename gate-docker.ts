@@ -14,6 +14,7 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { HttpsProxyAgent } from 'hpagent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
@@ -1797,6 +1798,34 @@ setInterval(() => {
     }
   }
 }, POOL_CLEANUP_MS);
+
+// Automatic Background Scraper (ProxyHub / public feeds)
+const AUTO_SCRAPE_HOURS = parseFloat(process.env.AUTO_SCRAPE_HOURS || '4');
+const SCRAPER_SCRIPT = path.join(process.cwd(), 'scripts', 'push_proxyhub.py');
+
+function runBackgroundScraper() {
+  if (!fs.existsSync(SCRAPER_SCRIPT)) return;
+  console.log('[AutoScraper] Starting scheduled ProxyHub scraping in background...');
+  try {
+    const proc = spawn('python3', [SCRAPER_SCRIPT, '5'], {
+      env: { ...process.env, GATE_URL: `http://127.0.0.1:${PORT}/api/proxies` },
+      stdio: 'ignore'
+    });
+    proc.on('close', (code) => {
+      console.log(`[AutoScraper] Background ProxyHub crawler finished (exit code ${code})`);
+    });
+  } catch (e: any) {
+    console.error(`[AutoScraper] Failed to spawn scraper: ${e.message}`);
+  }
+}
+
+if (AUTO_SCRAPE_HOURS > 0) {
+  const scrapeMs = Math.round(AUTO_SCRAPE_HOURS * 3600 * 1000);
+  // Initial run after 20 seconds
+  setTimeout(runBackgroundScraper, 20000);
+  // Recurring interval
+  setInterval(runBackgroundScraper, scrapeMs);
+}
 
 // ═══════════════════════════════════════════════════════════
 //  Startup

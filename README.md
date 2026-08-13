@@ -75,9 +75,9 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 
 ---
 
-## ⚡ Quick Start
+## ⚡ Quick Start & How to Run
 
-### 1. Run with Bun (Local Development)
+### Option 1: Direct Run in Terminal (Live Interactive Logs)
 
 ```bash
 # Clone repository
@@ -87,23 +87,41 @@ cd opencodezengate-freeapi
 # Install dependencies
 bun install
 
-# Start the gateway engine
+# Start gateway (Press Ctrl + C anytime to stop)
 bun run gate-docker.ts
 ```
 
-Gateway will be live at `http://localhost:13339` with Web Dashboard accessible at `http://localhost:13339/`.
+---
+
+### Option 2: Run in Background (Silent Daemon)
+
+```bash
+# Start in background
+nohup bun run gate-docker.ts > zengate.log 2>&1 &
+
+# View live logs anytime
+tail -f zengate.log
+
+# Stop the background process
+pkill -f "gate-docker.ts"
+```
 
 ---
 
-### 2. Run with Docker Compose (Production)
+### Option 3: Run with Docker Compose (Production)
 
 ```bash
 # Start ZenGate container
 docker compose up -d
 
 # View live logs
-docker logs -f zengate
+docker compose logs -f
+
+# Stop container
+docker compose down
 ```
+
+Gateway will be live at `http://localhost:13339` with Web Dashboard accessible at `http://localhost:13339/`.
 
 ---
 
@@ -129,6 +147,12 @@ Add the `zengate` provider to your `~/.config/opencode/opencode.json` file under
         "apiKey": "admin123"
       },
       "models": {
+        "big-pickle": {
+          "name": "Big Pickle (ZenGate Free)",
+          "reasoning": true,
+          "limit": { "context": 128000, "output": 8192 },
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        },
         "nemotron-3.5-lightning-free": {
           "name": "Nemotron 3.5 Lightning (ZenGate Free)",
           "reasoning": true,

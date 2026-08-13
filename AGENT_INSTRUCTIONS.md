@@ -56,6 +56,12 @@ config["provider"]["zengate"] = {
         "apiKey": "admin123"
     },
     "models": {
+        "big-pickle": {
+            "name": "Big Pickle (ZenGate Free)",
+            "reasoning": True,
+            "limit": {"context": 128000, "output": 8192},
+            "modalities": {"input": ["text", "image"], "output": ["text"]}
+        },
         "nemotron-3.5-lightning-free": {
             "name": "Nemotron 3.5 Lightning (ZenGate Free)",
             "reasoning": True,
