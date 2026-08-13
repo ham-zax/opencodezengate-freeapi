@@ -1,0 +1,44 @@
+name: Daily Cloudflare IP Update
+
+on:
+  schedule:
+    # Runs daily at 04:00 UTC (matching upstream schedule)
+    - cron: '0 4 * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Benchmark & Generate 500ip.txt
+        run: |
+          python3 scripts/update_cf_ips.py
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add 500ip.txt cfip_opencode_formatted.txt
+          
+          if git diff --cached --quiet; then
+            echo "No changes in IP latency rankings today."
+          else
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            git commit -m "daily: update 500ip ${TIMESTAMP}"
+            git push origin main
+          fi
