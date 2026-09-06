@@ -182,6 +182,13 @@ let warpSkipUntil = 0;
 let cachedModels: any[] = [];
 let cachedModelsTime = 0;
 
+// models.dev pricing metadata: source of truth for cost==0 (free), so stealth
+// free models like `big-pickle` (no `-free` suffix) are detected without hardcoding.
+let modelsDevFreeIds: Set<string> | null = null;
+let modelsDevTime = 0;
+const MODELS_DEV_URL = 'https://models.dev/api.json';
+const MODELS_DEV_TTL_MS = 3600000;
+
 const API_KEY = process.env.API_KEY || 'admin123';
 
 let candidates: CandidateItem[] = [];
@@ -475,8 +482,19 @@ async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number 
         rejectUnauthorized: false,
         timeout: PROXY_PROBE_TIMEOUT,
       }, (res) => {
-        res.on('data', () => {});
-        res.on('end', () => resolve({ ok: res.statusCode! >= 200 && res.statusCode! < 400 }));
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          // Status 200 is not enough: captive portals and hijacked proxies
+          // return 200 with an HTML login page. Require a real models payload.
+          if (res.statusCode! < 200 || res.statusCode! >= 400) return resolve({ ok: false });
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+            resolve({ ok: Array.isArray(parsed?.data) });
+          } catch {
+            resolve({ ok: false });
+          }
+        });
       });
       req.on('error', () => resolve({ ok: false }));
       req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
@@ -809,6 +827,19 @@ function doHttpsStream(
   });
 }
 
+// Streaming can be Anthropic-style (/messages) or OpenAI-style
+// (/chat/completions, /responses with "stream": true in the JSON body).
+function isStreamRequest(path: string, headers: Record<string, string>, body: string | undefined): boolean {
+  if (path.includes('/messages')) return true;
+  if (headers['accept'] === 'text/event-stream' || path.includes('stream')) return true;
+  if (body) {
+    try {
+      if ((JSON.parse(body) as any)?.stream === true) return true;
+    } catch {}
+  }
+  return false;
+}
+
 // ═══════════════════════════════════════════════════════════
 //  Audit Records
 // ═══════════════════════════════════════════════════════════
@@ -922,7 +953,7 @@ async function dispatch(
     const start = Date.now();
     let agent: https.Agent | undefined;
     try {
-      const isStream = path.includes('/messages') && (headers['accept'] === 'text/event-stream' || path.includes('stream'));
+      const isStream = isStreamRequest(path, headers, body);
       if (isStream) {
         const result = await doHttpsStream(path, method, headers, body, undefined);
         const latencyMs = Date.now() - start;
@@ -959,7 +990,7 @@ async function dispatch(
   const start = Date.now();
 
   try {
-    const isStream = path.includes('/messages') && (headers['accept'] === 'text/event-stream' || path.includes('stream'));
+    const isStream = isStreamRequest(path, headers, body);
     if (isStream) {
       const result = await doHttpsStream(path, method, headers, body, agent);
       const latencyMs = Date.now() - start;
@@ -1066,7 +1097,8 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, st
   h['authorization'] = 'Bearer public';
   if (!h['x-opencode-client']) h['x-opencode-client'] = 'desktop';
   if (!h['content-type']) h['content-type'] = 'application/json';
-  if (!h['user-agent']) h['user-agent'] = 'OpenCode/1.0.0 (desktop)';
+  // Zen throttles non-opencode User-Agents harder (opencodex #2067): always identify as opencode.
+  h['user-agent'] = 'opencode';
   return h;
 }
 
@@ -1250,6 +1282,57 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
   }
 
   // –– Fetch model list from upstream, filter free models, and cache ––
+  // /v1/models only carries id/object/created/owned_by (no free flag), so the
+  // `-free` suffix alone misses stealth free models like `big-pickle`.
+  // Better way: join live upstream availability with models.dev pricing
+  // (.opencode.models[id].cost == 0/0 means free). Falls back to the
+  // opencodex rule (`-free` suffix or `big-pickle`) when models.dev is
+  // unreachable. Advertised IDs keep their upstream-original form so they
+  // stay callable; stripped aliases are normalized on the chat path below.
+function fetchJsonDirect(url: string, timeoutMs: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: 'GET',
+      headers: { accept: 'application/json', 'user-agent': 'zengate' },
+      rejectUnauthorized: false,
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+        } catch (e: any) {
+          reject(new Error(`bad-json: ${e?.message || e}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.end();
+  });
+}
+
+async function fetchModelsDevFreeIds(): Promise<Set<string> | null> {
+  if (modelsDevFreeIds && Date.now() - modelsDevTime < MODELS_DEV_TTL_MS) {
+    return modelsDevFreeIds;
+  }
+  const doc: any = await fetchJsonDirect(MODELS_DEV_URL, 10000);
+  const models = doc?.opencode?.models || {};
+  const free = new Set<string>();
+  for (const [id, m] of Object.entries<any>(models)) {
+    const cost = (m as any)?.cost;
+    if (cost && cost.input === 0 && cost.output === 0) free.add(id);
+  }
+  modelsDevFreeIds = free;
+  modelsDevTime = Date.now();
+  return free;
+}
+
+function isFreeBySuffix(id: string): boolean {
+  return id.endsWith('-free') || id === 'big-pickle';
+}
+
 async function fetchModelsFromUpstream(): Promise<any[]> {
   let agent: https.Agent | undefined;
   if (warpSlot) {
@@ -1277,13 +1360,46 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.end();
   });
-  const freeModels = (result.data || []).filter((m: any) => m.id && m.id.endsWith('-free')).map((m: any) => ({
-    ...m,
-    id: m.id.replace(/-free$/, ''),
-  }));
+  const upstreamList: any[] = result.data || [];
+  let freeModels: any[];
+  try {
+    const freeSet = await fetchModelsDevFreeIds();
+    if (freeSet) {
+      freeModels = upstreamList.filter((m: any) => m.id && freeSet.has(m.id));
+    } else {
+      freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
+    }
+  } catch (e: any) {
+    console.warn(`[Models] models.dev lookup failed, suffix fallback: ${e?.message || e}`);
+    freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
+  }
   cachedModels = freeModels;
   cachedModelsTime = Date.now();
   return freeModels;
+}
+
+// Accept stripped aliases for backward compat (e.g. `mimo-v2.5` → `mimo-v2.5-free`).
+// Never rewrites `big-pickle` or paid models; only maps when `${model}-free`
+// is a known free model from the cached roster.
+// Also injects stream_options.include_usage on streamed requests so usage
+// comes back in the SSE trailer (opencodex openai-chat.ts does the same);
+// otherwise streamed calls never record token counts.
+function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefined {
+  if (!bodyStr) return bodyStr;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    const model = parsed?.model;
+    if (typeof model === 'string' && model && model !== 'big-pickle' && !model.endsWith('-free')) {
+      const want = `${model}-free`;
+      if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
+    }
+    if (parsed?.stream === true && parsed.stream_options === undefined) {
+      parsed.stream_options = { include_usage: true };
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return bodyStr;
+  }
 }
 
 // –– API: Models ––
@@ -1699,7 +1815,10 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
     const startTime = Date.now();
 
     const reqHeaders = collectHeadersFromReq(nodeReq);
-    const bodyStr = method !== 'GET' && method !== 'HEAD' ? await readBody(nodeReq) : undefined;
+    let bodyStr = method !== 'GET' && method !== 'HEAD' ? await readBody(nodeReq) : undefined;
+    if (bodyStr && (upstreamPath.includes('/chat/completions') || upstreamPath.includes('/responses'))) {
+      bodyStr = normalizeFreeModelAlias(bodyStr);
+    }
 
     // Intercept /v1/models → return cached free models (no slot allocation needed)
     if (upstreamPath === '/v1/models' && method === 'GET') {
@@ -1721,11 +1840,14 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
     }
 
     try {
-      // Get or create Key slot pool
-      const pool = await getKeySlotPool(authKey);
+      // Get or create Key slot pool. When no proxy slot can be allocated
+      // (all public candidates dead), fall through to the direct-connection
+      // fallback inside dispatch() instead of 503 — direct works fine and
+      // a failed proxy must not make the gateway unavailable.
+      let pool = await getKeySlotPool(authKey);
       if (!pool) {
-        sendJson(nodeRes, 503, { error: 'service_unavailable', message: 'Unable to allocate proxy slot, please try again later' });
-        return;
+        console.log(`[Allocate] Key ${authKey.slice(0,7)}... No proxy slot, using direct fallback`);
+        pool = { keyId: authKey, slots: [], rrCursor: 0, lastUsedAt: Date.now() };
       }
 
       const result = await dispatch(upstreamPath + search, method, reqHeaders, bodyStr, pool);
