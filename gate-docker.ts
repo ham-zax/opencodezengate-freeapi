@@ -46,7 +46,13 @@ interface KeySlotPool {
 
 interface CandidateItem extends ProxyItem {
   lockedBy: string | null;
+  /** Consecutive probe failures; evicted after MAX_CANDIDATE_FAILS. */
+  failCount?: number;
 }
+
+// Candidates that fail probing this many times in a row are evicted so the
+// pool cannot fill up with permanently dead proxies that are retried forever.
+const MAX_CANDIDATE_FAILS = 3;
 
 // ═══════════════════════════════════════════════════════════
 //  Persistence File Paths
@@ -635,7 +641,22 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
     }));
     for (const r of results) {
       if (newSlots.length >= SLOTS_PER_KEY) break;
-      if (!r.ok) continue;
+      const cand = candidates.find(c => c.address === r.item.address);
+      if (!r.ok) {
+        // Track failures and evict persistently dead candidates.
+        if (cand) {
+          cand.failCount = (cand.failCount || 0) + 1;
+          if (cand.failCount >= MAX_CANDIDATE_FAILS && !cand.lockedBy) {
+            candidates.splice(candidates.indexOf(cand), 1);
+            const custIdx = customProxyItems.findIndex(c => c.address === cand.address);
+            if (custIdx >= 0) customProxyItems.splice(custIdx, 1);
+            saveCustomProxies();
+            console.log(`[Evict] ${cand.address} failed ${cand.failCount}x, removed`);
+          }
+        }
+        continue;
+      }
+      if (cand) cand.failCount = 0;
       const url = r.item.protocol === 'socks5' ? `socks5h://${r.item.address}` : `http://${r.item.address}`;
       newSlots.push({
         addr: r.item.address, url,
@@ -643,7 +664,6 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
         latencyMs: r.latencyMs || 0,
         qualityGrade: r.item.quality_grade || 'C',
       });
-      const cand = candidates.find(c => c.address === r.item.address);
       if (cand) cand.lockedBy = keyId;
       console.log(`[Allocate+] ${r.item.address} (${r.latencyMs}ms) → Key ${keyId.slice(0, 7)}...`);
     }
@@ -1929,7 +1949,9 @@ function runBackgroundScraper() {
   if (!fs.existsSync(SCRAPER_SCRIPT)) return;
   console.log('[AutoScraper] Starting scheduled ProxyHub scraping in background...');
   try {
-    const proc = spawn('python3', [SCRAPER_SCRIPT, '5'], {
+  // Scrape deeper than the default: proxyhub.me's first pages are static and
+  // dedup makes re-scraping them a no-op (Added 0). Deeper pages rotate.
+    const proc = spawn('python3', [SCRAPER_SCRIPT, '25'], {
       env: { ...process.env, GATE_URL: `http://127.0.0.1:${PORT}/api/proxies` },
       stdio: 'ignore'
     });
