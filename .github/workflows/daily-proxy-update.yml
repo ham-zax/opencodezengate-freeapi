@@ -1,0 +1,44 @@
+name: Daily Proxy Seed Update
+
+on:
+  schedule:
+    # Runs daily at 04:30 UTC (after the Cloudflare IP update)
+    - cron: '30 4 * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  update-proxies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Scrape fresh proxies into seed file
+        run: |
+          OUTPUT_FILE=custom_proxies.json MAX_SEED_ITEMS=2000 python3 scripts/push_proxyhub.py 30
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add custom_proxies.json
+
+          if git diff --cached --quiet; then
+            echo "No proxy seed changes today."
+          else
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            git commit -m "daily: update proxy seed ${TIMESTAMP}"
+            git push origin main
+          fi

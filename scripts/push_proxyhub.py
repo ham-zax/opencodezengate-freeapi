@@ -8,6 +8,11 @@ import os, sys, time, json, urllib.request
 
 BASE = "https://proxyhub.me/zh/all-free-proxy-list.html"
 GATE = os.environ.get("GATE_URL", "http://127.0.0.1:13339/api/proxies")
+# Dump mode (for CI): when OUTPUT_FILE is set, write the scraped proxies to
+# that file in custom_proxies.json format instead of POSTing to a gateway.
+OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "")
+# Cap seed file size so the repo file stays small and reviewable.
+MAX_SEED_ITEMS = int(os.environ.get("MAX_SEED_ITEMS", "2000"))
 TOTAL_PAGES = int(os.environ.get("TOTAL_PAGES", "100"))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
@@ -68,6 +73,43 @@ def push(proxies):
         out(f"  Push failed: {e}")
         return 0
 
+def dump(proxies, path):
+    """Write proxies to path in custom_proxies.json format.
+
+    Merges with the existing file (fresh first, dedup by address) so
+    previously known proxies that rotated off the scraped pages survive.
+    """
+    items = []
+    seen = set()
+    for p in proxies:
+        is_socks = p.startswith("socks5://")
+        addr = p.replace("socks5://", "")
+        if addr in seen:
+            continue
+        seen.add(addr)
+        items.append({"address": addr,
+                      "protocol": "socks5" if is_socks else "http",
+                      "latency": 0, "quality_grade": "C"})
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = json.load(f)
+        for e in (old if isinstance(old, list) else []):
+            addr = e.get("address", "")
+            if addr and addr not in seen:
+                seen.add(addr)
+                items.append({"address": addr,
+                              "protocol": e.get("protocol", "http"),
+                              "latency": 0, "quality_grade": "C"})
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        out(f"  Existing seed unreadable, starting fresh: {e}")
+    items = items[:MAX_SEED_ITEMS]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=2)
+    out(f"  Seed file written: {path} ({len(items)} items)")
+    return len(items)
+
 def main():
     import re
     # Allow overriding pages from command-line argument (e.g. python3 push_proxyhub.py 5)
@@ -102,6 +144,9 @@ def main():
         time.sleep(0.8)
 
     out(f"Crawl complete: HTTP/HTTPS {len(http)} items, SOCKS5 {len(socks5)} items")
+    if OUTPUT_FILE:
+        dump(http + [f"socks5://{s}" if not s.startswith("socks5://") else s for s in socks5], OUTPUT_FILE)
+        return
     # Push in batches (500 per batch)
     added = 0
     for batch in [http[i:i+500] for i in range(0, len(http), 500)]:
