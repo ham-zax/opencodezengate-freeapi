@@ -4,11 +4,12 @@
   "description": "Reverse proxy gateway with automatic proxy rotation for opencode.ai/zen free models",
   "type": "module",
   "private": true,
-  "main": "gate.ts",
+  "main": "gate-docker.ts",
   "scripts": {
-    "start": "bun run gate.ts"
+    "start": "bun run gate-docker.ts"
   },
   "dependencies": {
+    "geoip-lite": "^2.0.3",
     "hpagent": "^1.2.0",
     "socks-proxy-agent": "^8.0.5"
   },
