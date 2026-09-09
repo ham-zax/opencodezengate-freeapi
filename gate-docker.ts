@@ -483,7 +483,13 @@ async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number 
     const result = await new Promise<{ ok: boolean }>((resolve) => {
       const req = https.request(`${UPSTREAM}/v1/models`, {
         method: 'GET',
-        headers: { accept: 'application/json', authorization: 'Bearer public', 'x-opencode-client': 'desktop' },
+        headers: {
+          accept: 'application/json',
+          authorization: 'Bearer public',
+          'x-opencode-client': 'desktop',
+          'x-opencode-session': crypto.randomUUID(),
+          'user-agent': 'opencode',
+        },
         agent,
         rejectUnauthorized: false,
         timeout: PROXY_PROBE_TIMEOUT,
@@ -528,7 +534,13 @@ async function probeWarp(): Promise<boolean> {
     const result = await new Promise<{ ok: boolean }>((resolve) => {
       const req = https.request(`${UPSTREAM}/v1/models`, {
         method: 'GET',
-        headers: { accept: 'application/json', authorization: 'Bearer public' },
+        headers: {
+          accept: 'application/json',
+          authorization: 'Bearer public',
+          'x-opencode-client': 'desktop',
+          'x-opencode-session': crypto.randomUUID(),
+          'user-agent': 'opencode',
+        },
         agent,
         rejectUnauthorized: false,
         timeout: 5000,
@@ -1116,6 +1128,8 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, st
   }
   h['authorization'] = 'Bearer public';
   if (!h['x-opencode-client']) h['x-opencode-client'] = 'desktop';
+  if (!h['x-opencode-session']) h['x-opencode-session'] = crypto.randomUUID();
+  if (!h['x-opencode-project']) h['x-opencode-project'] = crypto.randomUUID();
   if (!h['content-type']) h['content-type'] = 'application/json';
   // Zen throttles non-opencode User-Agents harder (opencodex #2067): always identify as opencode.
   h['user-agent'] = 'opencode';
@@ -1361,7 +1375,13 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
   const result = await new Promise<any>((resolve, reject) => {
     const req = https.request(`${UPSTREAM}/v1/models`, {
       method: 'GET',
-      headers: { accept: 'application/json', authorization: 'Bearer public' },
+      headers: {
+        accept: 'application/json',
+        authorization: 'Bearer public',
+        'x-opencode-client': 'desktop',
+        'x-opencode-session': crypto.randomUUID(),
+        'user-agent': 'opencode',
+      },
       agent,
       rejectUnauthorized: false,
       timeout: 10000,
@@ -1393,14 +1413,30 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
     console.warn(`[Models] models.dev lookup failed, suffix fallback: ${e?.message || e}`);
     freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
   }
+  // Add convenient aliases if target model is present
+  const aliasMap: Record<string, string> = {
+    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+  };
+  for (const [aliasId, canonicalId] of Object.entries(aliasMap)) {
+    const target = freeModels.find((m: any) => m.id === canonicalId);
+    if (target && !freeModels.some((m: any) => m.id === aliasId)) {
+      freeModels.push({
+        id: aliasId,
+        object: 'model',
+        created: target.created,
+        owned_by: target.owned_by || 'opencode',
+      });
+    }
+  }
+
   cachedModels = freeModels;
   cachedModelsTime = Date.now();
   return freeModels;
 }
 
-// Accept stripped aliases for backward compat (e.g. `mimo-v2.5` → `mimo-v2.5-free`).
-// Never rewrites `big-pickle` or paid models; only maps when `${model}-free`
-// is a known free model from the cached roster.
+// Accept stripped and common aliases (e.g. `mimo-v2.5` → `mimo-v2.5-free`, `muse-spark-1.3-free` → `muse-spark-1.3-contributor-free`).
+// Never rewrites `big-pickle` or paid models.
 // Also injects stream_options.include_usage on streamed requests so usage
 // comes back in the SSE trailer (opencodex openai-chat.ts does the same);
 // otherwise streamed calls never record token counts.
@@ -1409,9 +1445,20 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
   try {
     const parsed = JSON.parse(bodyStr);
     const model = parsed?.model;
-    if (typeof model === 'string' && model && model !== 'big-pickle' && !model.endsWith('-free')) {
-      const want = `${model}-free`;
-      if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
+    if (typeof model === 'string' && model) {
+      const KNOWN_EXPLICIT_ALIASES: Record<string, string> = {
+        'muse-spark-1.3': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.2': 'muse-spark-1.2-contributor-free',
+        'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+        'ling-3.0-flash-fin': 'ling-3.0-flash-fin-free',
+      };
+      if (KNOWN_EXPLICIT_ALIASES[model]) {
+        parsed.model = KNOWN_EXPLICIT_ALIASES[model];
+      } else if (model !== 'big-pickle' && !model.endsWith('-free')) {
+        const want = `${model}-free`;
+        if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
+      }
     }
     if (parsed?.stream === true && parsed.stream_options === undefined) {
       parsed.stream_options = { include_usage: true };

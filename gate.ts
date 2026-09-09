@@ -125,7 +125,10 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, st
   }
   h['authorization'] = 'Bearer public';
   if (!h['x-opencode-client']) h['x-opencode-client'] = 'desktop';
+  if (!h['x-opencode-session']) h['x-opencode-session'] = crypto.randomUUID();
+  if (!h['x-opencode-project']) h['x-opencode-project'] = crypto.randomUUID();
   if (!h['content-type']) h['content-type'] = 'application/json';
+  h['user-agent'] = 'opencode';
   return h;
 }
 
@@ -1094,12 +1097,46 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
       return;
     }
 
+function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefined {
+  if (!bodyStr) return bodyStr;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    const model = parsed?.model;
+    if (typeof model === 'string' && model) {
+      const KNOWN_EXPLICIT_ALIASES: Record<string, string> = {
+        'muse-spark-1.3': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.2': 'muse-spark-1.2-contributor-free',
+        'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+        'ling-3.0-flash-fin': 'ling-3.0-flash-fin-free',
+        'ling-3.0-flash': 'ling-3.0-flash-fin-free',
+        'nemotron-3.5-lightning': 'nemotron-3.5-lightning-free',
+        'nemotron-3-ultra': 'nemotron-3-ultra-free',
+        'deepseek-v4-flash': 'deepseek-v4-flash-free',
+        'mimo-v2.5': 'mimo-v2.5-free',
+      };
+      if (KNOWN_EXPLICIT_ALIASES[model]) {
+        parsed.model = KNOWN_EXPLICIT_ALIASES[model];
+      } else if (model !== 'big-pickle' && !model.endsWith('-free')) {
+        parsed.model = `${model}-free`;
+      }
+    }
+    if (parsed?.stream === true && parsed.stream_options === undefined) {
+      parsed.stream_options = { include_usage: true };
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return bodyStr;
+  }
+}
+
     // ───────────────────────────────────────────────
     //  v1/chat/completions  — Non-streaming
     // ───────────────────────────────────────────────
     if (path === '/v1/chat/completions' && (method === 'POST' || method === 'OPTIONS')) {
       if (method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'POST,OPTIONS', 'access-control-allow-headers': '*' }); res.end(); return; }
-      const body = await readBody(req);
+      let body = await readBody(req);
+      body = normalizeFreeModelAlias(body) || body;
       const auth = req.headers['authorization'] || '';
       const key = auth.replace(/^Bearer\s+/i, '').trim();
       const v = validateKey(key);
@@ -1148,7 +1185,10 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
       if (!v.valid) { json(res, 401, { error: { message: v.reason } }); return; }
       acquireKey(key);
       try {
-        const body = method === 'GET' || method === 'DELETE' ? undefined : await readBody(req);
+        let body = method === 'GET' || method === 'DELETE' ? undefined : await readBody(req);
+        if (body && (path.includes('/chat/completions') || path.includes('/responses'))) {
+          body = normalizeFreeModelAlias(body);
+        }
         const result = await dispatchNonStream(path, method, collectHeadersFromReq(req), body || '', key);
         // /v1/models only preserves free models (compatible with legacy behavior; big-pickle is stealth free model)
         if (path === '/v1/models' && result.status === 200 && result.body) {
@@ -1159,6 +1199,21 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
               const id = String(m.id || '');
               return id.endsWith('-free') || id === 'big-pickle';
             });
+            const aliasMap: Record<string, string> = {
+              'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+              'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+            };
+            for (const [aliasId, canonicalId] of Object.entries(aliasMap)) {
+              const target = freeModels.find((m: any) => m.id === canonicalId);
+              if (target && !freeModels.some((m: any) => m.id === aliasId)) {
+                freeModels.push({
+                  id: aliasId,
+                  object: 'model',
+                  created: target.created,
+                  owned_by: target.owned_by || 'opencode',
+                });
+              }
+            }
             parsed.data = freeModels;
             parsed.models = freeModels;
             res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });

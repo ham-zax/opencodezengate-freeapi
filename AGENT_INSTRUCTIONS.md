@@ -59,42 +59,50 @@ config["provider"]["zengate"] = {
         "big-pickle": {
             "name": "Big Pickle (ZenGate Free)",
             "reasoning": True,
-            "limit": {"context": 128000, "output": 8192},
-            "modalities": {"input": ["text", "image"], "output": ["text"]}
+            "limit": {"context": 200000, "output": 32000},
+            "modalities": {"input": ["text"], "output": ["text"]}
+        },
+        "muse-spark-1.3-free": {
+            "name": "Muse Spark 1.3 Free (ZenGate)",
+            "reasoning": True,
+            "limit": {"context": 1048576, "output": 131072},
+            "modalities": {"input": ["text", "image", "video", "pdf", "audio"], "output": ["text"]}
+        },
+        "muse-spark-1.2-free": {
+            "name": "Muse Spark 1.2 Free (ZenGate)",
+            "reasoning": True,
+            "limit": {"context": 1048576, "output": 131072},
+            "modalities": {"input": ["text", "image", "video", "pdf", "audio"], "output": ["text"]}
+        },
+        "ling-3.0-flash-fin-free": {
+            "name": "Ling 3.0 Flash Fin (ZenGate Free)",
+            "reasoning": True,
+            "limit": {"context": 262144, "output": 32768},
+            "modalities": {"input": ["text"], "output": ["text"]}
         },
         "nemotron-3.5-lightning-free": {
             "name": "Nemotron 3.5 Lightning (ZenGate Free)",
             "reasoning": True,
-            "limit": {"context": 128000, "output": 8192},
+            "limit": {"context": 262144, "output": 262144},
             "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
         "nemotron-3-ultra-free": {
             "name": "Nemotron 3 Ultra (ZenGate Free)",
             "reasoning": True,
-            "limit": {"context": 128000, "output": 8192},
-            "modalities": {"input": ["text"], "output": ["text"]}
-        },
-        "hy3-free": {
-            "name": "Hunyuan 3 (ZenGate Free)",
-            "reasoning": True,
-            "limit": {"context": 128000, "output": 8192},
-            "modalities": {"input": ["text"], "output": ["text"]}
-        },
-        "laguna-s-2.1-free": {
-            "name": "Laguna S 2.1 (ZenGate Free)",
-            "limit": {"context": 128000, "output": 8192},
+            "limit": {"context": 1000000, "output": 128000},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "deepseek-v4-flash-free": {
             "name": "DeepSeek V4 Flash (ZenGate Free)",
             "reasoning": True,
-            "limit": {"context": 128000, "output": 8192},
+            "limit": {"context": 200000, "output": 128000},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "mimo-v2.5-free": {
             "name": "MiMo 2.5 (ZenGate Free)",
-            "limit": {"context": 128000, "output": 8192},
-            "modalities": {"input": ["text"], "output": ["text"]}
+            "reasoning": True,
+            "limit": {"context": 200000, "output": 32000},
+            "modalities": {"input": ["text", "image", "audio", "video"], "output": ["text"]}
         }
     }
 }
