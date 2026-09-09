@@ -17,6 +17,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { HttpsProxyAgent } from 'hpagent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import geoip from 'geoip-lite';
 
 // ═══════════════════════════════════════════════════════════
 //  Type Definitions
@@ -27,6 +28,7 @@ interface ProxyItem {
   protocol: string;
   latency: number;
   quality_grade: string;
+  country?: string;
 }
 
 interface Slot {
@@ -64,8 +66,33 @@ const CUSTOM_PROXIES_FILE = path.join(process.cwd(), 'custom_proxies.json');
 const AUDIT_FILE = path.join(process.cwd(), 'audit.jsonl');
 
 // ═══════════════════════════════════════════════════════════
-//  Proxy source configuration (dynamic, persisted to sources.json)
+//  Country Filters & Proxy Sources
 // ═══════════════════════════════════════════════════════════
+
+const BLOCKED_COUNTRIES = new Set([
+  'CN', // China (Region blocked by OpenCode)
+  'RU', // Russia (Region blocked by OpenCode)
+  'IR', // Iran (Region blocked by OpenCode)
+  'KP', // North Korea
+  'CU', // Cuba
+  'SY', // Syria
+  'BY', // Belarus
+  'VE', // Venezuela
+  'MM', // Myanmar
+]);
+
+const PREFERRED_COUNTRIES = new Set([
+  'IN', // India (Primary user region - fast & verified)
+  'US', // United States (Fully supported)
+  'GB', // United Kingdom
+  'DE', // Germany
+  'FR', // France
+  'SG', // Singapore (Low latency to India)
+  'CA', // Canada
+  'JP', // Japan
+  'NL', // Netherlands
+  'AU', // Australia
+]);
 
 const DEFAULT_SOURCES = [
   {
@@ -77,6 +104,23 @@ const DEFAULT_SOURCES = [
       return list
         .filter((p) => ['S','A','B','C'].includes(p.quality_grade) && p.status === 'active')
         .map((p) => ({ address: p.address, protocol: p.protocol, latency: p.latency || 999, quality_grade: p.quality_grade }));
+    },
+  },
+  {
+    name: 'proxifly',
+    url: 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json',
+    type: 'json' as const,
+    parser: (data: any): ProxyItem[] => {
+      const list: any[] = Array.isArray(data) ? data : [];
+      return list
+        .filter((p) => p.ip && p.port && (p.protocol === 'socks5' || p.protocol === 'http'))
+        .map((p) => ({
+          address: `${p.ip}:${p.port}`,
+          protocol: p.protocol,
+          latency: p.latency || 999,
+          quality_grade: p.score >= 1 ? 'B' : 'C',
+          country: p.geolocation?.country || undefined,
+        }));
     },
   },
   {
@@ -162,7 +206,7 @@ const SLOTS_PER_KEY = 3;
 const POOL_CLEANUP_MS = 60000;
 const KEY_IDLE_RELEASE_MS = 600000;
 
-const PROXY_PROBE_TIMEOUT = parseInt(process.env.PROXY_PROBE_TIMEOUT || '8000');
+const PROXY_PROBE_TIMEOUT = parseInt(process.env.PROXY_PROBE_TIMEOUT || '2500');
 const PROXY_REFRESH_MS = parseInt(process.env.PROXY_REFRESH_MS || '300000');
 const CUSTOM_PROXIES = process.env.CUSTOM_PROXIES || '';
 const ZENPROXY_RELAY = process.env.ZENPROXY_RELAY || 'https://zenproxy.top/api/relay';
@@ -443,41 +487,65 @@ async function loadCandidates(): Promise<void> {
     const key = `${item.protocol}://${item.address}`;
     if (!seen.has(key)) { seen.add(key); all.push(item); }
   }
+  // Geo-filtering: remove proxies from blocked regions (China, Russia, Iran, etc.)
+  let geoBlockedCount = 0;
+  const filtered: ProxyItem[] = [];
+  for (const item of all) {
+    const ip = item.address.split(':')[0];
+    const country = item.country || geoip.lookup(ip)?.country || 'UNKNOWN';
+    item.country = country;
+    if (BLOCKED_COUNTRIES.has(country)) {
+      geoBlockedCount++;
+      continue;
+    }
+    filtered.push(item);
+  }
+
+  // Sorting: Grade (S > A > B > C) -> Preferred countries (IN, US, GB, DE, SG, etc.) -> Verified Lowest Latency
   const gradeOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
-  all.sort((a, b) => {
+  filtered.sort((a, b) => {
     const ga = gradeOrder[a.quality_grade] ?? 99;
     const gb = gradeOrder[b.quality_grade] ?? 99;
     if (ga !== gb) return ga - gb;
-    return (a.latency || 999) - (b.latency || 999);
+    const pa = PREFERRED_COUNTRIES.has(a.country || '') ? 0 : 1;
+    const pb = PREFERRED_COUNTRIES.has(b.country || '') ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    const la = (a.latency && a.latency > 0 && a.latency < 999) ? a.latency : 9999;
+    const lb = (b.latency && b.latency > 0 && b.latency < 999) ? b.latency : 9999;
+    if (la !== lb) return la - lb;
+    return (a.failCount || 0) - (b.failCount || 0);
   });
+
   const oldLocked = new Map<string, string>();
   for (const c of candidates) { if (c.lockedBy) oldLocked.set(c.address, c.lockedBy); }
-  candidates = all.map(item => ({
+  candidates = filtered.map(item => ({
     ...item,
     lockedBy: oldLocked.get(item.address) || null,
   }));
   const srcCount = proxySources.length;
-  console.log(`[Pool] Aggregated ${srcCount} sources`, customProxyItems.length > 0 ? `+ ${customProxyItems.length} custom` : '', `total ${candidates.length} candidates`);
+  const preferredCount = candidates.filter(c => PREFERRED_COUNTRIES.has(c.country || '')).length;
+  console.log(`[GeoFilter] Filtered out ${geoBlockedCount} proxies from blocked regions (RU, CN, IR, etc.)`);
+  console.log(`[Pool] Aggregated ${srcCount} sources (${preferredCount} in preferred IN/US/EU regions) total ${candidates.length} clean candidates`);
 }
 
 // ═══════════════════════════════════════════════════════════
 //  Health Checking
 // ═══════════════════════════════════════════════════════════
 
-function makeAgent(url: string, proto: 'http' | 'socks5'): https.Agent {
+function makeAgent(url: string, proto: 'http' | 'socks5', timeoutMs = STREAM_TIMEOUT): https.Agent {
   if (proto === 'socks5') {
-    return new SocksProxyAgent(url, { timeout: PROXY_PROBE_TIMEOUT }) as unknown as https.Agent;
+    return new SocksProxyAgent(url, { timeout: timeoutMs }) as unknown as https.Agent;
   }
   return new HttpsProxyAgent({
     proxy: url,
     keepAlive: false,
-    timeout: PROXY_PROBE_TIMEOUT,
+    timeout: timeoutMs,
   }) as unknown as https.Agent;
 }
 
 async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number }> {
   const url = item.protocol === 'socks5' ? `socks5h://${item.address}` : `http://${item.address}`;
-  const agent = makeAgent(url, item.protocol as 'http' | 'socks5');
+  const agent = makeAgent(url, item.protocol as 'http' | 'socks5', PROXY_PROBE_TIMEOUT);
   const start = Date.now();
   try {
     const result = await new Promise<{ ok: boolean }>((resolve) => {
@@ -632,7 +700,8 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
     return (a.latency || 999) - (b.latency || 999);
   });
 
-  const pool = available.slice(0, SLOTS_PER_KEY * 3);
+  const maxToProbe = Math.min(available.length, 75);
+  const pool = available.slice(0, maxToProbe);
   if (pool.length === 0) {
     if (warpSlot) {
       const newPool: KeySlotPool = { keyId, slots: [warpSlot], rrCursor: 0, lastUsedAt: Date.now() };
@@ -644,7 +713,7 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   }
 
   const newSlots: Slot[] = [];
-  const groupSize = SLOTS_PER_KEY;
+  const groupSize = 15;
   for (let i = 0; i < pool.length && newSlots.length < SLOTS_PER_KEY; i += groupSize) {
     const group = pool.slice(i, i + groupSize);
     const results = await Promise.all(group.map(async (item) => {
@@ -710,7 +779,7 @@ function releaseKeySlots(keyId: string): void {
   console.log(`[Release] Key ${keyId.slice(0,7)}... Released ${count} slots`);
 }
 
-function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): void {
+async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
   if (idx >= 0) pool.slots.splice(idx, 1);
   const failedCand = candidates.find(c => c.address === failedAddr);
@@ -722,30 +791,33 @@ function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): void {
   }
 
   const lockedAddrs = new Set(pool.slots.map(s => s.addr));
-  const replacement = candidates.find(c => !c.lockedBy && !lockedAddrs.has(c.address));
-  if (!replacement) {
-    console.log(`[Replace] ${failedAddr} failed, no available candidate to replace (remaining slots: ${pool.slots.length})`);
-    return;
-  }
-
-  probe(replacement).then(r => {
-    if (r.ok) {
-      const url = replacement.protocol === 'socks5' ? `socks5h://${replacement.address}` : `http://${replacement.address}`;
+  const available = candidates.filter(c => !c.lockedBy && !lockedAddrs.has(c.address));
+  const testLimit = Math.min(available.length, 75);
+  const groupSize = 15;
+  for (let i = 0; i < testLimit; i += groupSize) {
+    const batch = available.slice(i, i + groupSize);
+    const results = await Promise.all(batch.map(async (c) => ({ cand: c, ...(await probe(c)) })));
+    for (const r of results) {
+      if (!r.ok && r.cand) {
+        r.cand.failCount = (r.cand.failCount || 0) + 1;
+      }
+    }
+    const winner = results.find(r => r.ok);
+    if (winner && pool.slots.length < SLOTS_PER_KEY && !pool.slots.some(s => s.addr === winner.cand.address)) {
+      const url = winner.cand.protocol === 'socks5' ? `socks5h://${winner.cand.address}` : `http://${winner.cand.address}`;
       const newSlot: Slot = {
-        addr: replacement.address, url,
-        proto: replacement.protocol as 'http' | 'socks5',
-        latencyMs: r.latencyMs || 0,
-        qualityGrade: replacement.quality_grade || 'C',
+        addr: winner.cand.address, url,
+        proto: winner.cand.protocol as 'http' | 'socks5',
+        latencyMs: winner.latencyMs || 0,
+        qualityGrade: winner.cand.quality_grade || 'C',
       };
       pool.slots.push(newSlot);
-      replacement.lockedBy = pool.keyId;
-      console.log(`[Replace+] ${replacement.address} (${r.latencyMs}ms) → Key ${pool.keyId.slice(0, 7)}...`);
-    } else {
-      console.log(`[Replace] ${replacement.address} probe failed, not replaced`);
+      winner.cand.lockedBy = pool.keyId;
+      console.log(`[Replace+] ${winner.cand.address} (${winner.latencyMs}ms) → Key ${pool.keyId.slice(0, 7)}...`);
+      return;
     }
-  }).catch(e => {
-    console.error(`[Replace] ${replacement.address} exception: ${e.message}`);
-  });
+  }
+  console.log(`[Replace] ${failedAddr} failed, could not find replacement among ${testLimit} candidates`);
 }
 
 async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
@@ -814,7 +886,14 @@ function doHttps(
   body: string | undefined, agent?: https.Agent,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const opts: any = { method, headers, timeout: TIMEOUT, rejectUnauthorized: false };
+    const reqHeaders = { ...headers };
+    delete reqHeaders['accept-encoding'];
+    delete reqHeaders['host'];
+    if (body) {
+      reqHeaders['content-length'] = String(Buffer.byteLength(body, 'utf-8'));
+      delete reqHeaders['transfer-encoding'];
+    }
+    const opts: any = { method, headers: reqHeaders, timeout: TIMEOUT, rejectUnauthorized: false };
     if (agent) opts.agent = agent;
     const req = https.request(`${UPSTREAM}${path}`, opts, (res) => {
       const chunks: Buffer[] = [];
@@ -834,26 +913,126 @@ function doHttpsStream(
   body: string | undefined, agent?: https.Agent,
 ): Promise<{ status: number; stream: ReadableStream<Uint8Array>; headers: Record<string, string> }> {
   return new Promise((resolve, reject) => {
-    const opts: any = { method, headers, timeout: STREAM_TIMEOUT, rejectUnauthorized: false };
+    let resolved = false;
+    const reqHeaders = { ...headers };
+    delete reqHeaders['accept-encoding'];
+    delete reqHeaders['host'];
+    if (body) {
+      reqHeaders['content-length'] = String(Buffer.byteLength(body, 'utf-8'));
+      delete reqHeaders['transfer-encoding'];
+    }
+    const opts: any = { method, headers: reqHeaders, timeout: STREAM_TIMEOUT, rejectUnauthorized: false };
     if (agent) opts.agent = agent;
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      try { agent?.destroy(); } catch {}
+    };
+
     const req = https.request(`${UPSTREAM}${path}`, opts, (res) => {
       const resHeaders: Record<string, string> = {};
       for (const [k, v] of Object.entries(res.headers)) {
         if (v) resHeaders[k] = Array.isArray(v) ? v[0] : v;
       }
-      res.on('end', () => { try { if (agent) agent.destroy(); } catch {} });
-      res.on('error', () => { try { if (agent) agent.destroy(); } catch {} });
+
+      const statusCode = res.statusCode || 200;
+      if (statusCode >= 400) {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            res.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
+            res.on('end', () => {
+              cleanup();
+              try { controller.close(); } catch {}
+            });
+            res.on('error', (e: Error) => {
+              cleanup();
+              try { controller.error(e); } catch {}
+            });
+          },
+          cancel() {
+            cleanup();
+            try { req.destroy(); } catch {}
+            try { res.destroy(); } catch {}
+          },
+        });
+        resolved = true;
+        return resolve({ status: statusCode, stream, headers: resHeaders });
+      }
+
+      let firstChunkReceived = false;
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const initialChunks: Uint8Array[] = [];
+
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-          res.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
-          res.on('end', () => { try { controller.close(); } catch {} });
-          res.on('error', (e: Error) => { try { controller.error(e); } catch {} });
+          streamController = controller;
+          for (const c of initialChunks) controller.enqueue(c);
+          initialChunks.length = 0;
+        },
+        cancel() {
+          cleanup();
+          try { req.destroy(); } catch {}
+          try { res.destroy(); } catch {}
         },
       });
-      resolve({ status: res.statusCode || 200, stream, headers: resHeaders });
+
+      res.on('data', (chunk: Buffer) => {
+        try { req.setTimeout(STREAM_TIMEOUT); } catch {}
+        const u8 = new Uint8Array(chunk);
+        if (!firstChunkReceived) {
+          firstChunkReceived = true;
+          if (streamController) {
+            streamController.enqueue(u8);
+          } else {
+            initialChunks.push(u8);
+          }
+          resolved = true;
+          resolve({ status: statusCode, stream, headers: resHeaders });
+        } else {
+          try { streamController?.enqueue(u8); } catch {}
+        }
+      });
+
+      res.on('end', () => {
+        cleanup();
+        if (!firstChunkReceived) {
+          if (!resolved) {
+            resolved = true;
+            reject(new Error('Proxy stream closed prematurely without data'));
+          }
+        } else {
+          try { streamController?.close(); } catch {}
+        }
+      });
+
+      res.on('error', (e: Error) => {
+        cleanup();
+        if (!firstChunkReceived) {
+          if (!resolved) {
+            resolved = true;
+            reject(e);
+          }
+        } else {
+          try { streamController?.error(e); } catch {}
+        }
+      });
     });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('Timeout')));
+
+    req.on('error', (e: Error) => {
+      cleanup();
+      if (!resolved) {
+        resolved = true;
+        reject(e);
+      } else {
+        try { req.destroy(); } catch {}
+      }
+    });
+    req.on('timeout', () => {
+      cleanup();
+      req.destroy(new Error('Timeout'));
+    });
     if (body) req.write(body);
     req.end();
   });
@@ -942,6 +1121,58 @@ function extractUsageFromResponse(respBody: string): { tokens: number; model: st
 //  Core dispatch — Per-Key Pool Routing
 // ═══════════════════════════════════════════════════════════
 
+async function dispatchDirect(
+  path: string, method: string, headers: Record<string, string>,
+  body: string | undefined, pool: KeySlotPool,
+): Promise<{ status: number; body?: string; stream?: ReadableStream<Uint8Array>; streamHeaders?: Record<string, string> }> {
+  console.log(`[Dispatch] fallback → Direct connection`);
+  const start = Date.now();
+  try {
+    const isStream = isStreamRequest(path, headers, body);
+    if (isStream) {
+      const result = await doHttpsStream(path, method, headers, body, undefined);
+      const latencyMs = Date.now() - start;
+      if (result.status >= 200 && result.status < 400) {
+        stats.total++; stats.success++;
+        audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
+        return { status: result.status, stream: result.stream, streamHeaders: result.headers };
+      }
+      stats.total++; stats.errors++;
+      audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
+      const reader = result.stream.getReader();
+      let directErr = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          directErr += new TextDecoder().decode(value);
+        }
+      } catch {}
+      if (directErr) {
+        console.warn(`[Dispatch] Direct fallback response: ${directErr.slice(0, 150)}`);
+        return { status: result.status, body: directErr };
+      }
+      return { status: result.status, body: `{"error":{"message":"Upstream error (${result.status})"}}` };
+    }
+    const result = await doHttps(path, method, headers, body, undefined);
+    const latencyMs = Date.now() - start;
+    if (result.status >= 200 && result.status < 400) {
+      stats.total++; stats.success++;
+      const usage = extractUsageFromResponse(result.body);
+      if (usage.tokens > 0) recordKeyUsage(pool.keyId, usage.tokens);
+      audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
+      return { status: result.status, body: result.body };
+    }
+    stats.total++; stats.errors++;
+    audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
+    return { status: result.status, body: result.body };
+  } catch (e: any) {
+    stats.total++; stats.errors++;
+    audit(502, Date.now() - start, 'direct', path, JSON.stringify({ error: e.message }), pool.keyId);
+    return { status: 502, body: JSON.stringify({ error: 'all_proxies_failed', message: 'All proxies and direct connection have failed' }) };
+  }
+}
+
 async function dispatch(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, pool: KeySlotPool,
@@ -975,51 +1206,31 @@ async function dispatch(
   }
 
   if (!selectedSlot) {
+    // Attempt emergency refill if pool has run dry
+    if (pool.slots.length === 0) {
+      console.log(`[Dispatch] Pool empty for Key ${pool.keyId.slice(0, 7)}..., attempting emergency refill`);
+      const refilled = await getKeySlotPool(pool.keyId);
+      if (refilled && refilled.slots.length > 0) {
+        pool.slots = refilled.slots;
+        selectedSlot = pool.slots[0];
+      }
+    }
+  }
+
+  if (!selectedSlot) {
     // ZenProxy fallback
     if (ZENPROXY_KEY) {
       console.log(`[Dispatch] all slots failed, fallback → ZenProxy relay`);
       return proxyViaRelay(path, method, headers, body);
     }
     // Direct connection fallback (zero-proxy mode)
-    console.log(`[Dispatch] all proxies failed, fallback → Direct connection`);
-    const start = Date.now();
-    let agent: https.Agent | undefined;
-    try {
-      const isStream = isStreamRequest(path, headers, body);
-      if (isStream) {
-        const result = await doHttpsStream(path, method, headers, body, undefined);
-        const latencyMs = Date.now() - start;
-        if (result.status >= 200 && result.status < 400) {
-          stats.total++; stats.success++;
-          audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
-          return { status: result.status, stream: result.stream, streamHeaders: result.headers };
-        }
-        stats.total++; stats.errors++;
-        audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
-        return { status: result.status, body: `{"error":"upstream_error"}` };
-      }
-      const result = await doHttps(path, method, headers, body, undefined);
-      const latencyMs = Date.now() - start;
-      if (result.status >= 200 && result.status < 400) {
-        stats.total++; stats.success++;
-        const usage = extractUsageFromResponse(result.body);
-        if (usage.tokens > 0) recordKeyUsage(pool.keyId, usage.tokens);
-        audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
-        return { status: result.status, body: result.body };
-      }
-      stats.total++; stats.errors++;
-      audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
-      return { status: result.status, body: result.body };
-    } catch (e: any) {
-      stats.total++; stats.errors++;
-      audit(502, Date.now() - start, 'direct', path, JSON.stringify({ error: e.message }), pool.keyId);
-      return { status: 502, body: JSON.stringify({ error: 'all_proxies_failed', message: 'All proxies and direct connection have failed' }) };
-    }
+    return dispatchDirect(path, method, headers, body, pool);
   }
 
   triedAddrs.add(selectedSlot.addr);
   const agent = makeAgent(selectedSlot.url, selectedSlot.proto);
   const start = Date.now();
+  let isStreamHandedOff = false;
 
   try {
     const isStream = isStreamRequest(path, headers, body);
@@ -1027,10 +1238,12 @@ async function dispatch(
       const result = await doHttpsStream(path, method, headers, body, agent);
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
+        isStreamHandedOff = true;
         stats.total++;
         stats.success++;
         console.log(`[Dispatch] ${selectedSlot.addr} stream OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
         proxyFailCount.delete(selectedSlot.addr);
+        audit(result.status, latencyMs, selectedSlot.addr, path, body, pool.keyId);
         return { status: result.status, stream: result.stream, streamHeaders: result.headers };
       }
       // Read error response body
@@ -1045,6 +1258,15 @@ async function dispatch(
       if (result.status === 429) stats.rateLimited++;
       else stats.errors++;
       console.error(`[Dispatch] ${selectedSlot.addr} stream ${result.status} (${latencyMs}ms) retry=${retry}`);
+      if (errBody) {
+        try {
+          const ep = JSON.parse(errBody);
+          const eMsg = ep?.error?.message || ep?.message || errBody.slice(0, 120);
+          console.warn(`[Dispatch] Upstream response: ${eMsg}`);
+        } catch {
+          console.warn(`[Dispatch] Upstream response: ${errBody.slice(0, 120)}`);
+        }
+      }
       const fails = (proxyFailCount.get(selectedSlot.addr) || 0) + 1;
       proxyFailCount.set(selectedSlot.addr, fails);
       if (fails >= PROXY_MAX_FAILS) {
@@ -1056,9 +1278,18 @@ async function dispatch(
         replaceFailedSlot(pool, selectedSlot.addr);
       }
       audit(result.status, latencyMs, selectedSlot.addr, path, errBody, pool.keyId);
+      // If proxy returned "Model is unavailable" (datacenter proxy geoblocked), try direct fallback
+      if (errBody && errBody.includes('Model is unavailable')) {
+        console.log(`[Dispatch] Model unavailable via proxy ${selectedSlot.addr}, attempting direct fallback...`);
+        const directRes = await dispatchDirect(path, method, headers, body, pool);
+        if (directRes.status >= 200 && directRes.status < 400) return directRes;
+      }
       if (retry < MAX_RETRIES) {
         return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
       }
+      console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
+      const directRes = await dispatchDirect(path, method, headers, body, pool);
+      if (directRes.status >= 200 && directRes.status < 400) return directRes;
       return { status: result.status, body: errBody };
     } else {
       const result = await doHttps(path, method, headers, body, agent);
@@ -1088,9 +1319,18 @@ async function dispatch(
         replaceFailedSlot(pool, selectedSlot.addr);
       }
       audit(result.status, latencyMs, selectedSlot.addr, path, result.body, pool.keyId);
+      // If proxy returned "Model is unavailable", try direct fallback
+      if (result.body && result.body.includes('Model is unavailable')) {
+        console.log(`[Dispatch] Model unavailable via proxy ${selectedSlot.addr}, attempting direct fallback...`);
+        const directRes = await dispatchDirect(path, method, headers, body, pool);
+        if (directRes.status >= 200 && directRes.status < 400) return directRes;
+      }
       if (retry < MAX_RETRIES) {
         return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
       }
+      console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
+      const directRes = await dispatchDirect(path, method, headers, body, pool);
+      if (directRes.status >= 200 && directRes.status < 400) return directRes;
       return { status: result.status, body: result.body };
     }
   } catch (e: any) {
@@ -1109,9 +1349,14 @@ async function dispatch(
     if (retry < MAX_RETRIES) {
       return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
     }
+    console.log(`[Dispatch] All proxy attempts failed with exception, attempting direct fallback...`);
+    const directRes = await dispatchDirect(path, method, headers, body, pool);
+    if (directRes.status >= 200 && directRes.status < 400) return directRes;
     return { status: 502, body: JSON.stringify({ error: 'proxy_error', message: e.message }) };
   } finally {
-    try { agent.destroy(); } catch {}
+    if (!isStreamHandedOff) {
+      try { agent.destroy(); } catch {}
+    }
   }
 }
 
@@ -1119,7 +1364,65 @@ async function dispatch(
 //  HTTP Server
 // ═══════════════════════════════════════════════════════════
 
-function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, string> {
+function sha256Hex(s: string): string {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+function stableID(prefix: string, value: string): string {
+  return prefix + '_' + sha256Hex(prefix + '\x00' + value).slice(0, 24);
+}
+
+function randomID(prefix: string, size = 16): string {
+  return prefix + '_' + crypto.randomBytes(size).toString('hex');
+}
+
+function firstNonEmpty(...values: (string | undefined | null)[]): string {
+  for (const v of values) {
+    const t = typeof v === 'string' ? v.trim() : '';
+    if (t) return t;
+  }
+  return '';
+}
+
+function conversationSeed(body: string): string {
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed) return '';
+    if (typeof parsed.input === 'string' && parsed.input) return parsed.input;
+    for (const field of ['messages', 'input']) {
+      const arr = parsed[field];
+      if (!Array.isArray(arr)) continue;
+      for (const item of arr) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.role !== 'user') continue;
+        const content = JSON.stringify(item.content);
+        if (content && content !== 'null') return content;
+      }
+    }
+  } catch {}
+  return '';
+}
+
+// Thinking models (deepseek, nemotron, muse-spark) require reasoning_content on every assistant message
+function patchMissingReasoningContent(reqBody: string): string {
+  if (!reqBody) return reqBody;
+  try {
+    const parsed = JSON.parse(reqBody);
+    if (!parsed || !Array.isArray(parsed.messages)) return reqBody;
+    let changed = false;
+    for (const m of parsed.messages) {
+      if (m && m.role === 'assistant' && !('reasoning_content' in m)) {
+        m.reasoning_content = '';
+        changed = true;
+      }
+    }
+    return changed ? JSON.stringify(parsed) : reqBody;
+  } catch {
+    return reqBody;
+  }
+}
+
+function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string): Record<string, string> {
   const h: Record<string, string> = {};
   for (const k of FORWARD) {
     if (k === 'authorization') continue;
@@ -1127,12 +1430,40 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage): Record<string, st
     if (v) h[k] = Array.isArray(v) ? v[0] : v;
   }
   h['authorization'] = 'Bearer public';
-  if (!h['x-opencode-client']) h['x-opencode-client'] = 'desktop';
-  if (!h['x-opencode-session']) h['x-opencode-session'] = crypto.randomUUID();
-  if (!h['x-opencode-project']) h['x-opencode-project'] = crypto.randomUUID();
+  h['x-opencode-client'] = 'cli';
+  h['user-agent'] = 'opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14';
   if (!h['content-type']) h['content-type'] = 'application/json';
-  // Zen throttles non-opencode User-Agents harder (opencodex #2067): always identify as opencode.
-  h['user-agent'] = 'opencode';
+
+  // Session: prefer client-provided, otherwise derive stableID from conversation seed
+  let sessionSignal = firstNonEmpty(
+    h['x-opencode-session'],
+    nodeReq.headers['x-session-id'] as string,
+    nodeReq.headers['conversation-id'] as string,
+  );
+  if (!sessionSignal && bodyStr) {
+    try {
+      const parsed = JSON.parse(bodyStr);
+      sessionSignal = firstNonEmpty(parsed?.conversation_id, parsed?.metadata?.session_id);
+    } catch {}
+  }
+  if (!sessionSignal && bodyStr) sessionSignal = conversationSeed(bodyStr);
+  if (!sessionSignal || sessionSignal === '{}') sessionSignal = randomID('fallback', 16);
+  if (!h['x-opencode-session']) h['x-opencode-session'] = stableID('ses', sessionSignal);
+
+  // Request: unique per request
+  if (!h['x-opencode-request']) h['x-opencode-request'] = randomID('req', 16);
+
+  // Project: client-provided or stable default
+  let projectSignal = firstNonEmpty(h['x-opencode-project']);
+  if (!projectSignal && bodyStr) {
+    try {
+      const parsed = JSON.parse(bodyStr);
+      projectSignal = firstNonEmpty(parsed?.metadata?.project_id);
+    } catch {}
+  }
+  if (!projectSignal) projectSignal = 'opencode2api:default-project';
+  if (!h['x-opencode-project']) h['x-opencode-project'] = stableID('prj', projectSignal);
+
   return h;
 }
 
@@ -1443,6 +1774,7 @@ async function fetchModelsFromUpstream(): Promise<any[]> {
 function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefined {
   if (!bodyStr) return bodyStr;
   try {
+    bodyStr = patchMissingReasoningContent(bodyStr);
     const parsed = JSON.parse(bodyStr);
     const model = parsed?.model;
     if (typeof model === 'string' && model) {
@@ -1662,8 +1994,11 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
         if (!trimmed) continue;
         const isSocks = trimmed.startsWith('socks5://') || trimmed.startsWith('socks5h://');
         const cleanAddr = trimmed.replace(/^https?:\/\//, '').replace(/^socks5h?:\/\//, '');
+        const ip = cleanAddr.split(':')[0];
+        const country = geoip.lookup(ip)?.country || 'UNKNOWN';
+        if (BLOCKED_COUNTRIES.has(country)) continue;
         if (!candidates.find(c => c.address === cleanAddr) && !customProxyItems.find(c => c.address === cleanAddr)) {
-          const item: ProxyItem = { address: cleanAddr, protocol: isSocks ? 'socks5' : 'http', latency: 0, quality_grade: 'C' };
+          const item: ProxyItem = { address: cleanAddr, protocol: isSocks ? 'socks5' : 'http', latency: 0, quality_grade: 'C', country };
           candidates.push({ ...item, lockedBy: null });
           customProxyItems.push(item);
           added++;
@@ -1881,11 +2216,11 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
     acquireKey(authKey);
     const startTime = Date.now();
 
-    const reqHeaders = collectHeadersFromReq(nodeReq);
     let bodyStr = method !== 'GET' && method !== 'HEAD' ? await readBody(nodeReq) : undefined;
     if (bodyStr && (upstreamPath.includes('/chat/completions') || upstreamPath.includes('/responses'))) {
       bodyStr = normalizeFreeModelAlias(bodyStr);
     }
+    const reqHeaders = collectHeadersFromReq(nodeReq, bodyStr);
 
     // Intercept /v1/models → return cached free models (no slot allocation needed)
     if (upstreamPath === '/v1/models' && method === 'GET') {
@@ -1920,23 +2255,55 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
       const result = await dispatch(upstreamPath + search, method, reqHeaders, bodyStr, pool);
 
       if (result.stream) {
-        // Streaming response
+        // Streaming response: clean hop-by-hop & conflicting headers from upstream
+        const cleanHeaders: Record<string, string> = {};
+        if (result.streamHeaders) {
+          for (const [k, v] of Object.entries(result.streamHeaders)) {
+            const lk = k.toLowerCase();
+            if (lk === 'connection' || lk === 'transfer-encoding' || lk === 'content-length' || lk === 'content-encoding') continue;
+            cleanHeaders[k] = v;
+          }
+        }
         nodeRes.writeHead(result.status, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
+          ...cleanHeaders,
+          'content-type': cleanHeaders['content-type'] || 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
           'connection': 'keep-alive',
+          'x-accel-buffering': 'no',
           'access-control-allow-origin': '*',
-          ...result.streamHeaders,
         });
         const reader = result.stream.getReader();
+        let clientClosed = false;
+        nodeReq.on('close', () => {
+          clientClosed = true;
+          reader.cancel().catch(() => {});
+        });
+        let streamTailBuf = '';
         try {
-          while (true) {
+          while (!clientClosed) {
             const { done, value } = await reader.read();
             if (done) break;
             nodeRes.write(value);
+            if (typeof (nodeRes as any).flush === 'function') {
+              (nodeRes as any).flush();
+            }
+            if (value && value.length > 0) {
+              const chunkStr = new TextDecoder().decode(value);
+              streamTailBuf = (streamTailBuf + chunkStr).slice(-2048);
+            }
           }
-        } catch {}
-        nodeRes.end();
+        } catch (err: any) {
+          console.warn(`[Dispatch] Stream read interrupted:`, err?.message || err);
+        } finally {
+          nodeRes.end();
+          try {
+            const usageMatch = streamTailBuf.match(/"usage"\s*:\s*\{[^}]*"total_tokens"\s*:\s*(\d+)/);
+            if (usageMatch) {
+              const tokens = parseInt(usageMatch[1], 10);
+              if (tokens > 0) recordKeyUsage(authKey, tokens);
+            }
+          } catch {}
+        }
       } else {
         // Standard response
         const respBody = result.body || '{}';
